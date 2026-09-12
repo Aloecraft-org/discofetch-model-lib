@@ -1,0 +1,559 @@
+-- cases for discofetch-model-lib. `M` is defined by test/run.sh, which wraps
+-- model.dlua in an IIFE and concatenates this file after it.
+--
+-- What is worth asserting here is what the comments in supervisor.lua paid
+-- for: the codec's regrouping, every refusal that has a name, the
+-- absence-vs-nil rules (published_locked, the REDACTED round trip, the
+-- required-key waiver), and the fact that the zone and the decoder are
+-- injected rather than global.
+
+local fails = 0
+local function ok(c, m) if c then print("   ok   " .. m) else print("   FAIL " .. m); fails = fails + 1 end end
+local function eq(a, b, m) ok(a == b, m .. '  (got ' .. tostring(a) .. ', wanted ' .. tostring(b) .. ')') end
+
+local ZONE = 'discofetch.link'
+local model = M.new({ zone = ZONE, json = json })
+
+-- ---------------------------------------------------------- the constructor
+
+do
+  local okc, err = pcall(M.new)
+  ok(not okc and tostring(err):find('deps.zone', 1, true) ~= nil,
+     'new with no deps fails NAMING zone: ' .. tostring(err):gsub('^.*: ', ''))
+  okc, err = pcall(M.new, { json = json })
+  ok(not okc and tostring(err):find('deps.zone', 1, true) ~= nil, 'new without zone names zone')
+  okc, err = pcall(M.new, { zone = ZONE })
+  ok(not okc and tostring(err):find('deps.json', 1, true) ~= nil, 'new without json names json')
+  okc, err = pcall(M.new, { zone = ZONE, json = {} })
+  ok(not okc and tostring(err):find('decode', 1, true) ~= nil, 'new with a json lacking decode names decode')
+  okc = pcall(M.new, { zone = 17, json = json })
+  ok(not okc, 'new with a non-string zone fails')
+end
+
+do -- two instances coexist; no module-level mutable state
+  local a = M.new({ zone = 'example.test', json = json })
+  local b = M.new({ zone = ZONE, json = json })
+  eq(a.fetchpoint_host('reflect.example.test'), 'reflect', 'instance a reads its own zone')
+  eq(a.fetchpoint_host('reflect.discofetch.link'), nil, 'instance a refuses the other zone')
+  eq(b.fetchpoint_host('reflect.discofetch.link'), 'reflect', 'instance b reads its own zone')
+  eq(a.fp_row({ label = 'abcdefghijklmnop', behavior = 'route' }).fqdn,
+     'abcdefghijklmnop.example.test', 'fqdn is spelled out of the INJECTED zone')
+  ok(a.valid_label == M.valid_label, 'the instance carries the pure half, so a consumer holds one handle')
+  ok(a.DIM.validate == M.DIM.validate, 'instance DIM keeps the shared pure members')
+  ok(type(a.DIM.of) == 'function' and a.DIM.of ~= b.DIM.of, 'instance DIM.of is bound per instance')
+end
+
+-- ------------------------------------------------------------- the codec
+--
+-- The regrouping is 8-bit bytes in, 5-bit symbols out, checked against an
+-- independent bit-string implementation rather than against itself.
+do
+  local function ref(hex)
+    local bits = {}
+    for i = 1, #hex do
+      local n = tonumber(hex:sub(i, i), 16)
+      for b = 3, 0, -1 do bits[#bits + 1] = (n >> b) & 1 end
+    end
+    local out = {}
+    local i = 1
+    while i + 4 <= #bits do
+      local v = 0
+      for c = 0, 4 do v = v * 2 + bits[i + c] end
+      out[#out + 1] = M.B32:sub(v + 1, v + 1)
+      i = i + 5
+    end
+    return table.concat(out)
+  end
+  for _, hex in ipairs({ '00000000000000000000', 'ffffffffffffffffffff',
+                         '0123456789abcdef0123', 'deadbeefdeadbeefdead',
+                         '00ff00ff00ff00ff00ff', '8000000000000000000f' }) do
+    eq(M.base32_from_hex(hex), ref(hex), 'base32 regroups ' .. hex)
+  end
+  eq(M.base32_from_hex('00000000000000000000'), 'aaaaaaaaaaaaaaaa', 'ten zero bytes are sixteen a')
+  eq(M.base32_from_hex('ffffffffffffffffffff'), '7777777777777777', 'ten ff bytes are sixteen 7')
+  -- RFC 4648 alphabet, lowercased: base32("a") is ME======, base32("ab") is MFRA====
+  eq(M.base32_from_hex('61'), 'm', 'the alphabet is RFC 4648 lowercased (0x61 -> m)')
+  eq(M.base32_from_hex('6162'), 'mfr', 'and 0x6162 -> mfr')
+  eq(#M.B32, 32, 'the alphabet holds 32 symbols')
+  ok(M.B32:find('0', 1, true) == nil and M.B32:find('1', 1, true) == nil
+     and M.B32:find('8', 1, true) == nil and M.B32:find('9', 1, true) == nil,
+     'and none of 0 1 8 9')
+  -- LABEL_BYTES and valid_label's #s == 16 are ONE FACT: ten bytes divides
+  -- into sixteen symbols with nothing left over.
+  eq(M.LABEL_BYTES, 10, 'LABEL_BYTES is ten')
+  eq(#M.base32_from_hex(string.rep('7e', M.LABEL_BYTES)), 16, 'LABEL_BYTES bytes make exactly 16 symbols')
+  ok(M.valid_label(M.base32_from_hex(string.rep('7e', M.LABEL_BYTES))), 'and what they make is a valid label')
+  eq((M.LABEL_BYTES * 8) % 5, 0, 'with no remainder')
+end
+
+-- ------------------------------------------------------------- predicates
+
+do
+  ok(M.valid_label('abcdefghijklmnop'), '16 lowercase symbols is a label')
+  ok(M.valid_label('a234567abcdefghi'), 'digits 2-7 are in the alphabet')
+  ok(not M.valid_label('abcdefghijklmno'), '15 is not')
+  ok(not M.valid_label('abcdefghijklmnopq'), '17 is not')
+  ok(not M.valid_label('ABCDEFGHIJKLMNOP'), 'uppercase is not')
+  ok(not M.valid_label('abcdefghijklmno0'), '0 is outside the alphabet')
+  ok(not M.valid_label('abcdefghijklmno1'), 'and so is 1')
+  ok(not M.valid_label(nil) and not M.valid_label(16), 'a non-string is not a label')
+
+  ok(M.valid_name_label('reflect'), 'reflect is a name label')
+  ok(not M.valid_name_label('ab'), 'two characters is too short')
+  ok(M.valid_name_label(string.rep('a', 63)), '63 is the ceiling')
+  ok(not M.valid_name_label(string.rep('a', 64)), '64 is over it')
+  ok(not M.valid_name_label('1abc'), 'a name label starts on a letter')
+  ok(M.valid_name_label('a-b-c'), 'single hyphens are fine')
+  ok(not M.valid_name_label('abc-'), 'a trailing hyphen is not')
+  ok(not M.valid_name_label('ab--cd'), 'and -- NEVER appears: it is the label--verb separator')
+  ok(not M.valid_name_label('Reflect'), 'uppercase is not a name label')
+  ok(not M.valid_name_label(nil), 'a non-string is not a name label')
+
+  ok(M.valid_ip('1.2.3.4'), 'a v4 literal')
+  ok(M.valid_ip('255.255.255.255'), 'the v4 ceiling')
+  ok(not M.valid_ip('256.1.1.1'), '256 in an octet is refused')
+  ok(not M.valid_ip('1.2.3'), 'three octets is not a v4 literal')
+  ok(not M.valid_ip('1.2.3.4444'), 'four digits in an octet is refused')
+  -- The `#o > 3` arm, on its own. '4444' is already out of range, so the
+  -- > 255 arm catches it and it proves nothing about the length arm. These
+  -- two octets are IN range, so only the length arm refuses them.
+  ok(not M.valid_ip('1.2.3.0255'), 'a zero-padded octet IN RANGE is refused by LENGTH, before tonumber')
+  ok(not M.valid_ip('0001.2.3.4'), 'and a zero-padded leading octet is refused the same way')
+  -- But the arm is a LENGTH test, not an octal test, so padding that stays
+  -- inside three characters still gets through. Carried over deliberately,
+  -- not fixed here; README "Known, carried over" 1 is where this is argued.
+  ok(M.valid_ip('01.2.3.4'), 'while SHORTER zero-padding is still accepted -- the guard is length, not octal')
+  ok(M.valid_ip('::1'), 'v6 loopback')
+  ok(M.valid_ip('fe80::1'), 'v6 link-local')
+  ok(not M.valid_ip('FE80::1'), 'v6 is checked lowercase only -- loose, on purpose')
+  ok(not M.valid_ip(string.rep('a', 46) .. ':'), 'over 45 characters is not an address')
+  ok(not M.valid_ip('hello world'), 'prose is not an address')
+  ok(not M.valid_ip('http://1.2.3.4'), 'nor is a URL')
+  ok(not M.valid_ip('example.com'), 'nor is a name')
+  ok(not M.valid_ip(nil) and not M.valid_ip(42), 'nor is a non-string')
+end
+
+-- -------------------------------------------------------- fetchpoint_host
+
+do
+  local fh = model.fetchpoint_host
+  local l = 'abcdefghijklmnop'
+  local b, v = fh(l .. '.' .. ZONE)
+  eq(b, l, 'a drawn label under the zone is a FetchPoint') ; eq(v, nil, 'with no verb')
+  b, v = fh('reflect.' .. ZONE)
+  eq(b, 'reflect', 'a reserved name is too') ; eq(v, nil, 'with no verb')
+  b, v = fh('reflect--dns.' .. ZONE)
+  eq(b, 'reflect', 'the first -- splits base from verb') ; eq(v, 'dns', 'and the verb comes back')
+  b, v = fh(l .. '--ice.' .. ZONE)
+  eq(b, l, 'a drawn label takes a verb too') ; eq(v, 'ice', 'ice')
+  -- Only EXACTLY ONE label-shaped component under the zone counts: a
+  -- wildcard certificate plus a creative sub-name must not address
+  -- something that was never allocated.
+  eq(fh('a.b.' .. ZONE), nil, 'a deeper name is not a FetchPoint')
+  eq(fh('api.discofetch.net'), nil, 'another domain is not')
+  eq(fh(ZONE), nil, 'the bare zone is not')
+  eq(fh(''), nil, 'an empty Host is not')
+  eq(fh(nil), nil, 'an absent Host is not')
+  eq(fh('1.2.3.4'), nil, 'the raw IP a health check arrives on is not')
+  eq(fh('ab.' .. ZONE), nil, 'a two-character name is neither label- nor name-shaped')
+  eq(fh('x--dns.' .. ZONE), nil, 'a verb on a base that is not name-shaped is refused')
+  eq(fh('re--fl--ect.' .. ZONE), nil, 'a second -- leaves a base that cannot be a name')
+end
+
+-- ------------------------------------------------ the registry and config
+
+do
+  ok(M.KINDS['system:reflect'].implemented and M.KINDS['system:rendezvous'].implemented
+     and M.KINDS['system:redirect'].implemented, 'the three served kinds are implemented')
+  ok(not M.KINDS['wireguard'].implemented and not M.KINDS['collab-draw'].implemented,
+     'the launch candidates are entries, not special cases, and are unimplemented')
+  ok(M.KINDS['system:rendezvous'].verbs.dns and M.KINDS['system:rendezvous'].verbs.join
+     and M.KINDS['system:rendezvous'].verbs.ice and M.KINDS['system:rendezvous'].verbs.outcome,
+     'rendezvous declares its four verbs')
+  eq(next(M.KINDS['system:reflect'].verbs), nil, 'reflect declares none')
+
+  local c, err = M.validate_config('system:redirect', { targett = 'http://x' })
+  ok(c == nil and err:find('targett', 1, true) ~= nil and err:find('system:redirect', 1, true) ~= nil,
+     'an unknown config key is refused BY NAME, with the kind: ' .. tostring(err))
+  c, err = M.validate_config('system:redirect', 'nope')
+  ok(c == nil and err == 'config must be a JSON object', 'a non-object config is refused')
+
+  -- The required-key waiver: a dimension-shaped row carries target as a
+  -- COLUMN, and the matrix has already demanded it.
+  c, err = M.validate_config('system:redirect', {})
+  ok(c == nil and err == 'config needs target for system:redirect', 'a required key is demanded')
+  c = M.validate_config('system:redirect', {}, true)
+  ok(type(c) == 'table', 'and waived when dims is true -- otherwise a redirect shape could never be created')
+
+  c, err = M.validate_config('system:rendezvous', { advertise_key = string.rep('k', 15) })
+  ok(c == nil and err:find('16-128', 1, true) ~= nil, 'a short string is refused with its bounds: ' .. tostring(err))
+  ok(M.validate_config('system:rendezvous', { advertise_key = string.rep('k', 16) }), '16 is in bounds')
+  ok(not M.validate_config('system:rendezvous', { advertise_key = string.rep('k', 129) }), '129 is not')
+  ok(not M.validate_config('system:rendezvous', { advertise_key = 17 }), 'a number is not a string')
+
+  c, err = M.validate_config('system:rendezvous', { address_override = 'somewhere' })
+  ok(c == nil and err:find('IPv4 or IPv6', 1, true) ~= nil, 'an ip field takes a literal only')
+  ok(M.validate_config('system:rendezvous', { address_override = '1.2.3.4' }), 'and takes one')
+
+  ok(not M.validate_config('system:rendezvous', { serve_port = 0 }), 'port 0 is refused')
+  ok(not M.validate_config('system:rendezvous', { serve_port = 65536 }), 'port 65536 is refused')
+  ok(not M.validate_config('system:rendezvous', { serve_port = 80.5 }), 'a fractional port is refused')
+  ok(not M.validate_config('system:rendezvous', { serve_port = '80' }), 'a string port is refused')
+  ok(M.validate_config('system:rendezvous', { serve_port = 65535 }), '65535 is a port')
+
+  ok(not M.validate_config('system:redirect', { target = 'ftp://x.example' }), 'a non-http scheme is refused')
+  ok(not M.validate_config('system:redirect', { target = 'http://a b.example' }), 'whitespace in a URL is refused')
+  ok(not M.validate_config('system:redirect', { target = 'http://' .. string.rep('a', 2048) .. '.example' }),
+     'an over-long URL is refused')
+  ok(M.validate_config('system:redirect', { target = 'https://example.com/x?y=1' }), 'an https URL is taken')
+
+  c, err = M.validate_config('system:redirect', { target = 'https://x.example', status = 303 })
+  ok(c == nil and err == 'status must be one of 301, 302, 307, 308', 'a choice is refused WITH the choices: ' .. tostring(err))
+  ok(M.validate_config('system:redirect', { target = 'https://x.example', status = 308 }), '308 is one of them')
+  ok(M.validate_config('system:rendezvous', { rooms = true }), 'a boolean choice takes true')
+  ok(not M.validate_config('system:rendezvous', { rooms = 'true' }), 'and not the string true')
+  ok(not M.validate_config('system:rendezvous', { room_capacity = 5 }), 'room_capacity is 4, 16 or 64')
+  ok(M.validate_config('system:rendezvous', { room_capacity = 64 }), '64 is one of them')
+
+  -- Cross-field rules, refused at config time BY NAME rather than at
+  -- runtime by surprise.
+  c, err = M.validate_config('system:rendezvous', { ice = true })
+  ok(c == nil and err:find('ice needs rooms', 1, true) == 1, 'ice needs rooms')
+  c, err = M.validate_config('system:rendezvous', { turn = true, rooms = true })
+  ok(c == nil and err:find('turn needs ice', 1, true) == 1, 'turn needs ice')
+  c, err = M.validate_config('system:rendezvous', { turn = true, ice = true, rooms = true, room_auth = 'open' })
+  ok(c == nil and err:find('spends your relay allowance', 1, true) ~= nil,
+     'turn is refused on an OPEN room: an anonymous credential spends the owner\'s relay allowance')
+  ok(M.validate_config('system:rendezvous', { turn = true, ice = true, rooms = true, room_auth = 'key' }),
+     'turn with ice, rooms and a key is allowed')
+  local cfg = { rooms = true }
+  ok(M.validate_config('system:rendezvous', cfg) == cfg, 'a valid config comes back as the same table')
+end
+
+-- --------------------------------------------- secrets, the window, REDACTED
+
+do
+  local s = M.secret_fields('system:rendezvous')
+  eq(#s, 2, 'rendezvous owns two credentials in its config')
+  eq(s[1], 'advertise_key', 'the ordered half follows the registry order, so a refusal can NAME one')
+  eq(s[2], 'room_pin', 'and names the second the same way on every run')
+  ok(s.advertise_key and s.room_pin, 'the set half answers "is this key secret"')
+  eq(#M.secret_fields('system:reflect'), 0, 'reflect owns none')
+  eq(#M.secret_fields('no such kind'), 0, 'an unknown kind answers empty rather than throwing')
+  ok(M.secret_fields('system:rendezvous').serve == nil, 'a plain setting is not a secret')
+
+  eq(M.REDACTED, 'redacted', 'REDACTED is exported, and is the one spelling of "withheld"')
+
+  local stored = { advertise_key = 'sekrit', room_pin = '1234', serve = 'json' }
+  ok(M.config_view(false, 'system:rendezvous', stored) == stored,
+     'the account holder reads their own keys: THIS IS THE WINDOW, NOT THE FIELD')
+  local view = M.config_view(true, 'system:rendezvous', stored)
+  ok(view ~= stored, 'a window gets a copy')
+  eq(view.advertise_key, M.REDACTED, 'with the credential replaced by the sentinel')
+  eq(view.room_pin, M.REDACTED, 'both of them')
+  eq(view.serve, 'json', 'and the settings beside them intact')
+  eq(stored.advertise_key, 'sekrit', 'the stored config is not touched')
+  local rview = M.config_view(true, 'system:redirect', { target = 'https://x.example' })
+  eq(rview.target, 'https://x.example', 'a kind with no secrets shows through a window')
+
+  -- The round trip the write half depends on: the sentinel comes back in a
+  -- whole-object PATCH and means "leave the stored value alone".
+  local echoed = {}
+  for k, v in pairs(view) do echoed[k] = v end
+  ok(echoed.advertise_key == M.REDACTED,
+     'a whole-object replace ALWAYS carries the sentinel back -- two spellings would 403 every staff PATCH')
+end
+
+do
+  ok(M.same_config({ a = 1 }, { a = 1 }), 'same fields are the same config')
+  ok(M.same_config({}, {}), 'two empty configs are the same')
+  ok(not M.same_config({ a = 1 }, { a = 2 }), 'a changed value is a change')
+  ok(not M.same_config({ a = 1 }, { a = 1, b = 2 }), 'an ADDED key is a change (the second loop)')
+  ok(not M.same_config({ a = 1, b = 2 }, { a = 1 }), 'a REMOVED key is a change (the first loop)')
+  ok(not M.same_config({ a = false }, {}), 'false is not absent')
+  ok(M.same_config({ a = false }, { a = false }), 'false equals false')
+  ok(M.same_config({ s = 'x', n = 1, b = true }, { b = true, n = 1, s = 'x' }),
+     'compared FIELD BY FIELD, so hash order cannot make a save look like a change')
+end
+
+-- ----------------------------------------------------------- the matrix
+
+local function refuse(body)
+  local d, code, msg = M.DIM.validate(body)
+  return d, code, msg
+end
+local BASE = { access = 'anyone', channel = 'http', behavior = 'report', subject = 'caller' }
+local function with(t)
+  local b = {}
+  for k, v in pairs(BASE) do b[k] = v end
+  for k, v in pairs(t) do if v == '<nil>' then b[k] = nil else b[k] = v end end
+  return b
+end
+
+do
+  local d, code, msg = refuse(with({ zzz = 1 }))
+  ok(d == nil and code == 'unknown_field' and msg == 'no field named zzz', 'an unknown field is refused by name')
+  for key, repl in pairs(M.DIM.RETIRED) do
+    d, code, msg = refuse(with({ [key] = 'x' }))
+    ok(d == nil and code == 'unknown_field' and msg == key .. ' was replaced by ' .. repl,
+       'the retired ' .. key .. ' is refused WITH its replacement: ' .. tostring(msg))
+  end
+
+  d, code, msg = refuse({ channel = 'http', behavior = 'report', subject = 'caller' })
+  ok(d == nil and code == 'missing_field' and msg == 'access is required', 'access is required')
+  d, code = refuse({ access = 'anyone', behavior = 'report', subject = 'caller' })
+  ok(d == nil and code == 'missing_field', 'channel is required')
+  d, code = refuse({ access = 'anyone', channel = 'http' })
+  ok(d == nil and code == 'missing_field', 'behavior is required')
+  d, code, msg = refuse(with({ channel = 'carrier-pigeon' }))
+  ok(d == nil and code == 'invalid_value' and msg == 'channel must be one of http, dns, both',
+     'a value outside the vocabulary is refused with the vocabulary')
+  d, code = refuse(with({ channel = 17 }))
+  ok(d == nil and code == 'invalid_value', 'a non-string dimension is refused')
+
+  -- report: about whom, and where the address comes from
+  d, code, msg = refuse(with({ subject = '<nil>' }))
+  ok(d == nil and code == 'missing_field' and msg:find('report needs subject', 1, true) == 1, 'a report needs a subject')
+  d, code = refuse(with({ source = 'observed' }))
+  ok(d == nil and code == 'not_applicable', 'a report of the caller stores nothing, so source does not apply')
+  d, code = refuse(with({ published_address = '1.2.3.4' }))
+  ok(d == nil and code == 'not_applicable', 'a report of the caller has no published address')
+  d, code = refuse(with({ published_locked = true }))
+  ok(d == nil and code == 'not_applicable', 'and nothing to lock')
+  d, code = refuse(with({ channel = 'dns' }))
+  ok(d == nil and code == 'dns_cannot_report_caller', 'the answer differs per caller and a DNS record cannot')
+  d, code = refuse(with({ subject = 'self' }))
+  ok(d == nil and code == 'missing_field', 'a report of self needs a source')
+  ok(refuse(with({ subject = 'self', source = 'observed' })), 'report of self with a source is accepted')
+  d, code, msg = refuse(with({ behavior = 'redirect', subject = 'self', redirect_target = 'https://x.example' }))
+  ok(d == nil and code == 'not_applicable' and msg:find('subject only applies', 1, true) == 1,
+     'subject only applies to a report')
+
+  -- DNS is a rendering, not an interface: nothing there can present a credential
+  d, code = refuse({ access = 'token', channel = 'dns', behavior = 'report', subject = 'self', source = 'observed' })
+  ok(d == nil and code == 'dns_needs_public', 'a dns-only name carries no credential, so it must be public')
+  d, code = refuse({ access = 'anyone', channel = 'dns', behavior = 'route' })
+  ok(d == nil and code == 'dns_cannot_route', 'routing is a data path and DNS only names things')
+  ok(refuse({ access = 'token', channel = 'both', behavior = 'report', subject = 'self', source = 'observed' }),
+     'channel both with a credential is fine -- only dns-ONLY is refused')
+end
+
+do -- redirect: two kinds, told apart by what answers
+  local d, code, msg = refuse({ access = 'anyone', channel = 'http', behavior = 'redirect',
+                                redirect_target = 'https://x.example' })
+  eq(d and d.redirect_kind, 'status', 'over http a redirect defaults to a status')
+  eq(d and d.redirect_target, 'https://x.example', 'and keeps its target')
+  d = refuse({ access = 'anyone', channel = 'dns', behavior = 'redirect', redirect_target = 'edge.example.com' })
+  eq(d and d.redirect_kind, 'cname', 'over dns it defaults to a cname')
+  d, code = refuse({ access = 'anyone', channel = 'dns', behavior = 'redirect',
+                     redirect_kind = 'status', redirect_target = 'https://x.example' })
+  ok(d == nil and code == 'status_needs_http', 'nothing answers a 3xx over DNS')
+  d, code = refuse({ access = 'anyone', channel = 'http', behavior = 'redirect', redirect_kind = 'cname',
+                     redirect_target = 'edge.example.com' })
+  ok(d == nil and code == 'cname_needs_dns', 'a CNAME is answered by the resolver alone')
+  d, code = refuse({ access = 'anyone', channel = 'dns', behavior = 'redirect', redirect_kind = 'cname' })
+  ok(d == nil and code == 'missing_field', 'a cname redirect needs the NAME to point at')
+  d, code = refuse({ access = 'anyone', channel = 'dns', behavior = 'redirect', redirect_target = '1.2.3.4' })
+  ok(d == nil and code == 'cname_needs_a_name', 'CNAME targets are names, not addresses')
+  d, code = refuse({ access = 'anyone', channel = 'dns', behavior = 'redirect', redirect_target = 'https://x.example' })
+  ok(d == nil and code == 'cname_needs_a_name', 'nor URLs')
+  d, code = refuse({ access = 'anyone', channel = 'dns', behavior = 'redirect', redirect_target = 'edge..example.com' })
+  ok(d == nil and code == 'invalid_value', 'a doubled dot is not a hostname')
+  d, code = refuse({ access = 'anyone', channel = 'dns', behavior = 'redirect', redirect_target = 'edge-.example.com' })
+  ok(d == nil and code == 'invalid_value', 'nor a hyphen before a dot')
+  d, code = refuse({ access = 'anyone', channel = 'dns', behavior = 'redirect', redirect_target = 'nodots' })
+  ok(d == nil and code == 'invalid_value', 'nor a single component')
+
+  d, code = refuse({ access = 'anyone', channel = 'http', behavior = 'redirect',
+                     redirect_target = 'https://x.example', source = 'observed' })
+  ok(d == nil and code == 'not_applicable', 'a redirect to a FIXED target has no reported address')
+  d, code = refuse({ access = 'anyone', channel = 'both', behavior = 'redirect',
+                     redirect_target = 'https://x.example' })
+  ok(d == nil and code == 'nothing_to_publish', 'and no address to publish in DNS')
+  d, code = refuse({ access = 'anyone', channel = 'http', behavior = 'redirect' })
+  ok(d == nil and code == 'missing_field', 'a redirect with NO target sends callers to its own address, so it needs a source')
+  d = refuse({ access = 'anyone', channel = 'http', behavior = 'redirect', source = 'observed' })
+  ok(d and d.source == 'observed' and d.redirect_target == nil, 'and is accepted with one')
+  d, code = refuse({ access = 'anyone', channel = 'http', behavior = 'redirect',
+                     redirect_target = 'https://x.example', redirect_status = 303 })
+  ok(d == nil and code == 'invalid_value', '303 is not one of the four statuses we answer')
+  d = refuse({ access = 'anyone', channel = 'http', behavior = 'redirect',
+               redirect_target = 'https://x.example', redirect_status = 307 })
+  eq(d and d.redirect_status, 307, '307 is')
+  for st in pairs(M.DIM.STATUSES) do
+    ok(refuse({ access = 'anyone', channel = 'http', behavior = 'redirect',
+                redirect_target = 'https://x.example', redirect_status = st }) ~= nil,
+       tostring(st) .. ' is an answerable redirect status')
+  end
+  d, code = refuse(with({ redirect_target = 'https://x.example' }))
+  ok(d == nil and code == 'not_applicable', 'redirect_* fields only apply to a redirect')
+  d, code = refuse(with({ redirect_status = 301 }))
+  ok(d == nil and code == 'not_applicable', 'including the status')
+  d, code = refuse(with({ redirect_kind = 'status' }))
+  ok(d == nil and code == 'not_applicable', 'including the kind')
+end
+
+do -- report_format, the published address and its lock, the rest
+  local d, code = refuse(with({ subject = 'self', source = 'observed', report_format = 'text' }))
+  ok(d == nil and code == 'not_applicable', 'report_format only applies to a report of the CALLER')
+  d = refuse(with({ report_format = 'addr-port' }))
+  eq(d and d.report_format, 'addr-port', 'and is kept for one')
+
+  d, code = refuse({ access = 'anyone', channel = 'http', behavior = 'report', subject = 'self',
+                     source = 'asserted', published_address = 'somewhere' })
+  ok(d == nil and code == 'invalid_value', 'a published address is an IP literal')
+  d = refuse({ access = 'anyone', channel = 'http', behavior = 'report', subject = 'self',
+               source = 'asserted', published_address = '1.2.3.4' })
+  eq(d and d.published_address, '1.2.3.4', 'and is carried through when it is one')
+  eq(d and d.published_locked, true, 'an ASSERTED address is by definition not tracking anything, so it locks itself')
+  d = refuse({ access = 'anyone', channel = 'http', behavior = 'report', subject = 'self',
+               source = 'asserted', published_locked = false })
+  eq(d and d.published_locked, false, 'unless the body says otherwise')
+  d = refuse({ access = 'anyone', channel = 'http', behavior = 'report', subject = 'self', source = 'observed' })
+  eq(d and d.published_locked, nil, 'an observed source leaves the lock ABSENT rather than false')
+  d, code = refuse({ access = 'anyone', channel = 'http', behavior = 'report', subject = 'self',
+                     source = 'observed', published_locked = 'yes' })
+  ok(d == nil and code == 'invalid_value', 'the lock is true or false')
+
+  d, code = refuse(with({ serve_relay_config = 'yes' }))
+  ok(d == nil and code == 'invalid_value', 'serve_relay_config is true or false')
+  d = refuse(with({ serve_relay_config = true }))
+  eq(d and d.serve_relay_config, true, 'and is carried when it is')
+  d, code = refuse(with({ template = string.rep('t', 65) }))
+  ok(d == nil and code == 'invalid_value', 'a template is at most 64 characters')
+  d = refuse(with({ template = 'reflect' }))
+  eq(d and d.template, 'reflect', 'and is carried')
+  d = refuse(with({ name = 'my name', rooms = true, config = { rooms = true } }))
+  ok(d ~= nil and d.name == nil and d.rooms == nil and d.config == nil,
+     'name, rooms and config are ACCEPTED fields that are not dimensions: they never land in d')
+end
+
+do -- kind_of: TRANSITIONAL, and the reverse of DIM.of
+  eq(M.DIM.kind_of({ behavior = 'report', subject = 'caller' }), 'system:reflect', 'a report of the caller is served by reflect')
+  eq(M.DIM.kind_of({ behavior = 'report', subject = 'self' }), 'system:rendezvous', 'a report of self by rendezvous')
+  eq(M.DIM.kind_of({ behavior = 'redirect', redirect_target = 'https://x' }), 'system:redirect', 'a fixed redirect by redirect')
+  eq(M.DIM.kind_of({ behavior = 'redirect' }), 'system:rendezvous', 'a redirect to its own address by rendezvous')
+  eq(M.DIM.kind_of({ behavior = 'route' }), 'wireguard', 'route is declared, unserved, 501')
+end
+
+-- ------------------------------------------------------ DIM.of, the derive
+
+do
+  local d, cfg = model.DIM.of({
+    kind = 'system:redirect', behavior = 'report', subject = 'self', source = 'observed',
+    access = 'token', channel = 'both', template = 'rendezvous',
+    published_address = '9.9.9.9', published_locked = 1, serve_relay_config = 0,
+    report_format = 'text', config = '{"a":1}',
+  })
+  eq(d.behavior, 'report', 'a row with columns is read from its COLUMNS, never from kind')
+  eq(d.access, 'token', 'access comes from the column')
+  eq(d.published_locked, true, 'sqlite 1 becomes true')
+  eq(d.serve_relay_config, false, 'sqlite 0 becomes false')
+  eq(cfg.a, 1, 'and the config is decoded once, for both readers')
+
+  local dd = model.DIM.of({ kind = 'system:reflect', behavior = 'report', subject = 'self',
+                            source = 'observed', access = 'anyone', channel = 'http',
+                            published_locked = true })
+  eq(dd.published_locked, true, 'a real boolean is taken as itself')
+  dd = model.DIM.of({ kind = 'system:reflect', behavior = 'report', subject = 'caller',
+                      access = 'anyone', channel = 'http' })
+  eq(dd.published_locked, nil, 'an absent lock column stays ABSENT, not false')
+
+  -- TRANSITIONAL: rows written before migration 9 have no dimension columns
+  d, cfg = model.DIM.of({ kind = 'system:reflect', config = '{"format":"text"}' })
+  eq(d.behavior, 'report', 'an old reflect row derives report')
+  eq(d.subject, 'caller', 'of the caller')
+  eq(d.channel, 'http', 'over http')
+  eq(d.access, 'anyone', 'for anyone')
+  eq(d.report_format, 'text', 'carrying the old config.format')
+  eq(d.template, 'system:reflect', 'and the template falls back to the kind')
+
+  d = model.DIM.of({ kind = 'system:rendezvous', config = '{"serve":"dns"}' })
+  eq(d.channel, 'both', 'serve: dns maps to BOTH -- DNS was additive and the old enum forced a false choice')
+  eq(d.behavior, 'report', 'and it still reports')
+  eq(d.subject, 'self', 'about itself')
+  eq(d.source, 'observed', 'from what it observed')
+  eq(d.published_locked, false, 'unpinned, so the lock is off')
+
+  d = model.DIM.of({ kind = 'system:rendezvous', config = '{"serve":"redirect"}' })
+  eq(d.behavior, 'redirect', 'serve: redirect derives a redirect')
+  eq(d.redirect_kind, 'status', 'answered by us over http')
+  d = model.DIM.of({ kind = 'system:rendezvous', config = '{"serve":"dns","address_override":"5.6.7.8"}' })
+  eq(d.source, 'asserted', 'an address_override is an ASSERTED source')
+  eq(d.published_address, '5.6.7.8', 'published at that address')
+  eq(d.published_locked, true, 'and locked')
+  d = model.DIM.of({ kind = 'system:rendezvous', config = '{"ice":true}' })
+  eq(d.serve_relay_config, true, 'config.ice derives serve_relay_config')
+  d = model.DIM.of({ kind = 'system:rendezvous', config = '{}' })
+  eq(d.serve_relay_config, false, 'and its absence derives false')
+  -- The old branch OVERWRITES a column that arrived on the row; carried as is.
+  d = model.DIM.of({ kind = 'system:rendezvous', config = '{}', published_locked = 1 })
+  eq(d.published_locked, false, 'an old row derives its lock even when the column said otherwise (carried over)')
+
+  d = model.DIM.of({ kind = 'system:redirect', config = '{"target":"https://x.example","status":301}' })
+  eq(d.behavior, 'redirect', 'an old redirect row derives redirect')
+  eq(d.redirect_target, 'https://x.example', 'with its target')
+  eq(d.redirect_status, 301, 'and its status')
+  eq(d.redirect_kind, 'status', 'answered over http')
+  d = model.DIM.of({ kind = 'wireguard', config = '{}' })
+  eq(d.behavior, 'route', 'an unserved kind derives route')
+  eq(d.template, 'wireguard', 'templated on its kind')
+
+  -- Decoding: once, defensively, and never twice.
+  local t = { serve = 'json' }
+  local _, cfg2 = model.DIM.of({ kind = 'system:rendezvous', config = t })
+  ok(cfg2 == t, 'a config that is already a table is NOT decoded again')
+  local d3, cfg3 = model.DIM.of({ kind = 'system:rendezvous', config = 'not json at all' })
+  ok(type(cfg3) == 'table' and next(cfg3) == nil, 'a config that will not decode becomes empty rather than throwing')
+  eq(d3.behavior, 'report', 'and the row still derives')
+  local _, cfg4 = model.DIM.of({ kind = 'system:reflect' })
+  ok(type(cfg4) == 'table' and next(cfg4) == nil, 'an absent config decodes as empty')
+end
+
+-- ------------------------------------------------------------ row shaping
+
+do
+  local row = {
+    label = 'abcdefghijklmnop', name = 'my point', kind = 'system:rendezvous',
+    created_at = 111, updated_at = 222, config = '{"serve":"json"}',
+  }
+  local out = model.fp_row(row)
+  eq(out.fqdn, 'abcdefghijklmnop.' .. ZONE, 'fqdn is label plus zone')
+  eq(out.label, 'abcdefghijklmnop', 'the label rides along')
+  eq(out.kind, 'system:rendezvous', 'kind is still answered -- TRANSITIONAL, readers move to the dimensions')
+  eq(out.name, 'my point', 'and the name')
+  eq(out.created_at, 111, 'created_at') ; eq(out.updated_at, 222, 'updated_at')
+  eq(out.behavior, 'report', 'the dimensions are derived when none are handed in')
+  eq(out.published_locked, false, 'a name with a source of its own reports its lock')
+
+  local caller = model.fp_row({ label = 'aaaaaaaaaaaaaaaa', kind = 'system:reflect', config = '{}' })
+  eq(caller.source, nil, 'a report of the caller has no source')
+  ok(caller.published_locked == nil, 'so it reports NO lock at all -- absent, not false')
+
+  local given = model.fp_row(row, { behavior = 'route', template = 'handed-in' })
+  eq(given.template, 'handed-in', 'a caller that already derived the dimensions is not made to derive them twice')
+  eq(given.behavior, 'route', 'and its d wins')
+
+  local st = model.fp_row_status({
+    label = 'abcdefghijklmnop', kind = 'system:rendezvous',
+    config = '{"serve":"redirect","rooms":true,"address_override":"4.4.4.4","advertise_key":"sekrit"}',
+    adv_address = '8.8.8.8', adv_at = 999,
+  })
+  eq(st.mode.serve, 'redirect', 'the list row says what a rendezvous is FOR')
+  eq(st.mode.rooms, true, 'whether it holds rooms')
+  eq(st.mode.pinned, '4.4.4.4', 'and whether it is pinned')
+  ok(st.config == nil and st.mode.advertise_key == nil,
+     'without the config -- the advertise key lives there, and the list withholds it')
+  eq(st.advertised.address, '8.8.8.8', 'and reports the advertised address')
+  eq(st.advertised.at, 999, 'with its timestamp')
+
+  local st2 = model.fp_row_status({ label = 'abcdefghijklmnop', kind = 'system:rendezvous', config = '{}' })
+  eq(st2.mode.serve, 'json', 'serve defaults to json')
+  eq(st2.mode.rooms, false, 'rooms defaults to false')
+  eq(st2.mode.pinned, nil, 'and an unpinned name reports no pin')
+  ok(st2.advertised == nil, 'a name that has never advertised reports nothing, rather than a null pair')
+  local st3 = model.fp_row_status({ label = 'abcdefghijklmnop', kind = 'system:reflect', config = '{}' })
+  ok(st3.mode == nil, 'and only a rendezvous has a mode')
+end
+
+print(fails == 0 and "PASS" or ("FAIL " .. fails))

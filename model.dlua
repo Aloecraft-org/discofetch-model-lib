@@ -1,0 +1,778 @@
+-- discofetch-model-lib -- the domain model discofetch is written against.
+--
+-- The label alphabet, the kind registry, the four dimensions, config
+-- validation, the secret window and the row shapes. Extracted from
+-- api/supervisor.lua. It reaches nothing: no database handle, no host, no
+-- queue, no clock, and no other library in this set. Everything it cannot
+-- compute from its arguments (the zone, a json decoder) arrives through
+-- M.new.
+--
+-- ========================= surface =========================
+--
+-- (1) ENTRY POINTS. Bodies are in depth below -- Lua defines a function
+--     where it declares it, so the names are listed rather than declared
+--     twice. Two groups, and the split is the whole DI story of this file:
+--
+--     PURE, plain fields on M, no constructor:
+--       M.valid_ip(s)                      -- v4 strictly, v6 loosely
+--       M.base32_from_hex(hex)             -- the label/token codec
+--       M.valid_label(s)                   -- a drawn 16-symbol label
+--       M.valid_name_label(s)              -- a reserved/system name
+--       M.validate_config(kind, config, dims)  -- the registry's validator
+--       M.secret_fields(kind)              -- ordered list AND set
+--       M.config_view(impersonating, kind, config)
+--       M.same_config(a, b)
+--       M.DIM.validate(body)               -- the matrix, refusing by name
+--       M.DIM.kind_of(d)                   -- TRANSITIONAL
+--
+--     BOUND, because they need the deployment zone or a json decoder:
+--       local model = M.new({ zone = 'discofetch.link', json = json })
+--       model.DIM.of(r)        -> dimensions, decoded config
+--       model.fp_row(r, d)     -> the JSON shape of a fetchpoint row
+--       model.fp_row_status(r) -> fp_row plus mode and advertised
+--       model.fetchpoint_host(h) -> label, verb
+--
+--     The instance also carries the pure half, so a consumer holds ONE
+--     handle (deps.model) rather than a module and an instance. M.new
+--     names a missing dep in the assertion rather than letting it surface
+--     as a nil call three layers down.
+--
+--     config_view takes the IMPERSONATING BOOLEAN, not the request table.
+--     It used to read req.impersonating, a flag discofetch-accounts-lib
+--     writes; reading it here would make the pure model depend on the
+--     accounts request shape, which is a dependency no injected-deps list
+--     would ever show. The caller reads the boolean off req.
+--
+-- (2) CONFIGURABLE VALUES.
+--       M.B32, M.LABEL_BYTES  -- tied to each other, see below
+--       M.REDACTED            -- the one spelling of "withheld"
+--       DIM.STATUSES          -- the redirect statuses we answer
+--     (The zone is NOT here: it is deployment config and arrives at M.new.)
+--
+-- (3) FAN-OUT POINTS.
+--       M.KINDS       -- the kind registry: what validate_config enforces,
+--                        what GET /v1/kinds renders, what the verb gate
+--                        and the stats rollup read. A new kind is an entry.
+--       DIM.choices   -- the vocabulary; DIM.set is derived from it AT
+--                        LOAD by the loop below, and the loop is a
+--                        statement, not a declaration: it must run or
+--                        every membership test silently passes nothing.
+--       DIM.FIELDS    -- every key a dimension-shaped body may carry.
+--       DIM.RETIRED   -- config keys the dimensions replaced, and by what.
+--     The remaining dispatch is validate_config's f.type switch (string,
+--     ip, port, url, choice) plus its per-kind cross-field rules; both are
+--     in depth, marked there.
+--
+--     DIM is one namespace TABLE rather than seven loose locals. That was
+--     a main-chunk constraint in supervisor.lua and it relaxes in a module
+--     chunk; it is not restructured here, and the README says why.
+
+local M = {}
+
+-- ------------------------------------------------------------ the label
+--
+-- 16 symbols of RFC 4648 base32, lowercased: 80 bits, and the subdomain a
+-- FetchPoint lives at as well as its public id. doc/DATA-MODEL.md 3.1 has
+-- the reasoning, including why this is random rather than derived from the
+-- account and fetchpoint ids.
+--
+-- LABEL_BYTES and valid_label's length test are ONE FACT STATED TWICE, so
+-- they are stated next to each other: ten bytes divides into sixteen
+-- symbols with nothing left over, which is why the length is ten. The draw
+-- itself is not here -- host.crypto.random belongs to the caller, which is
+-- what keeps this library free of the host.
+M.B32 = 'abcdefghijklmnopqrstuvwxyz234567'
+M.LABEL_BYTES = 10          -- 80 bits, exactly 16 symbols, no remainder
+
+-- One spelling, named once, because two halves of the round trip depend on
+-- it agreeing with itself: config_view WRITES this word into the body it
+-- hands a window, and discofetch-fetchpoint-lib's fetchpoints_update reads
+-- it back out again to mean "leave the stored value alone". Spelled inline
+-- in either place, changing one and not the other turns every staff PATCH
+-- of a rendezvous point back into a 403 -- silently, and only for the kinds
+-- that own a secret. That is also why it is EXPORTED: the write half is now
+-- in another library and must import this word rather than keep a copy.
+-- supervisor's AUDIT_MASK still spells it inline; that is the same word for
+-- the same reason but a different mechanism, and it round-trips through
+-- nothing -- it should import M.REDACTED too.
+M.REDACTED = 'redacted'
+
+-- The kind registry. Keyed by the string the fetchpoint row stores; the
+-- scope prefix ('system:') is the seam custom code arrives through later
+-- -- an account-scoped kind becomes a lookup behind this table, not a
+-- schema change. The four launch candidates keep their unscoped names
+-- because rows may already carry them; they are entries here, not special
+-- cases, and serve 501 until their slices land.
+--
+-- config_fields is one definition with two consumers: the validator below
+-- enforces it and the panel's create form renders from it (GET /v1/kinds).
+-- verbs is the subdomain-suffix surface -- <label>--<verb>.discofetch.link
+-- -- which is why user-facing names may never contain '--'.
+M.KINDS = {
+  ['system:reflect'] = {
+    title = 'Reflect', implemented = true,
+    description = 'Answers with what the caller looks like from outside: '
+      .. 'observed address, method, path. Stateless. reflect.discofetch.link '
+      .. 'answers everyone for free; your own gets your traffic counters, '
+      .. 'your tier\'s rate limits, and a name your scripts can keep.',
+    config_fields = {
+      { key = 'format', type = 'choice', choices = { 'json', 'text' },
+        description = 'json (default) answers the whole observation; text '
+          .. 'answers the bare address and nothing else, for '
+          .. '`ip=$(curl -s https://<name>.discofetch.link)`. ?format= '
+          .. 'overrides either way on a single request. ?format=addr-port '
+          .. 'answers ADDRESS PORT for NAT diagnostics.' },
+      { key = 'debug_forwarded', type = 'choice', choices = { false, true },
+        description = 'Echo the RAW relay chain, internal hops included. '
+          .. 'Off, the public answer drops private-range entries; on, your '
+          .. 'own name shows the whole path, for debugging it.' },
+    },
+    verbs = {},
+  },
+  ['system:rendezvous'] = {
+    title = 'Rendezvous', implemented = true,
+    description = 'A meeting point. The owner advertises an observed '
+      .. 'address to it (the dns verb); readers find it there.',
+    config_fields = {
+      { key = 'advertise_key', type = 'string', min = 16, max = 128, secret = true,
+        description = 'Bearer the owner presents on <label>--dns to '
+          .. 'advertise. Generated at create. Omitted on PATCH it is kept; '
+          .. 'send a new value to rotate it, or "" to remove it.' },
+      { key = 'address_override', type = 'ip',
+        description = 'Pin the name to this address. While set, it wins '
+          .. 'over anything advertised; clear it to hand control back.' },
+      { key = 'serve', type = 'choice', choices = { 'json', 'redirect', 'dns' },
+        description = 'What the name does. json answers the address as '
+          .. 'JSON (default); redirect sends callers TO the address, so '
+          .. 'the name works in a browser before DNS does; dns publishes '
+          .. 'an A record and takes us out of the path entirely -- the '
+          .. 'name resolves straight to your machine.' },
+      { key = 'serve_scheme', type = 'choice', choices = { 'http', 'https' },
+        description = 'The scheme a redirect sends callers to. Default http.' },
+      { key = 'serve_port', type = 'port',
+        description = 'The port a redirect sends callers to. Default none '
+          .. '(the scheme\'s own).' },
+      { key = 'rooms', type = 'choice', choices = { false, true },
+        description = 'Allow ?room= meeting rooms: many candidate lists '
+          .. 'under one name, held in memory only, expiring on their own.' },
+      { key = 'room_auth', type = 'choice', choices = { 'key', 'pin', 'open' },
+        description = 'Who may join and read a room: holders of the '
+          .. 'advertise key, anyone with the pin, or anyone at all. '
+          .. 'Unguessable room names plus open is the secret-meeting-id '
+          .. 'pattern; joins are rate limited per name either way, so pin '
+          .. 'and open are safe to advertise.' },
+      { key = 'room_pin', type = 'string', min = 4, max = 32, secret = true,
+        description = 'The short human-typeable secret, when room_auth '
+          .. 'is pin.' },
+      { key = 'room_capacity', type = 'choice', choices = { 4, 16, 64 },
+        description = 'Candidates a room holds. Default 16.' },
+      { key = 'room_ttl', type = 'choice', choices = { 60, 300, 3600 },
+        description = 'Seconds a candidate stays without re-joining. '
+          .. 'Default 300. Presence, not history.' },
+      { key = 'ice', type = 'choice', choices = { false, true },
+        description = 'Serve the --ice verb (ice_servers for an '
+          .. 'RTCPeerConnection) and let a join carry ufrag, pwd and a '
+          .. 'candidate list, keyed by ufrag. Needs rooms.' },
+      { key = 'turn', type = 'choice', choices = { false, true },
+        description = 'Also hand out a TURN credential on --ice, minted '
+          .. 'per request and attributed to this name. Refused while '
+          .. 'room_auth is open: an anonymous credential spends your '
+          .. 'relay allowance for whoever asks.' },
+    },
+    verbs = { dns = true, join = true, ice = true, outcome = true },
+  },
+  ['system:redirect'] = {
+    title = 'Redirect', implemented = true,
+    description = 'Answers every request with a redirect to a fixed URL.',
+    config_fields = {
+      { key = 'target', type = 'url', required = true, max = 2048,
+        description = 'Where to send callers. http:// or https:// only.' },
+      { key = 'status', type = 'choice', choices = { 301, 302, 307, 308 },
+        description = 'The redirect status. Default 302.' },
+    },
+    verbs = {},
+  },
+  ['collab-draw'] = { title = 'Collaborative draw', implemented = false,
+                      config_fields = {}, verbs = {} },
+  ['collab-text'] = { title = 'Collaborative text', implemented = false,
+                      config_fields = {}, verbs = {} },
+  ['wireguard']   = { title = 'WireGuard', implemented = false,
+                      config_fields = {}, verbs = {} },
+  ['iot']         = { title = 'IoT rendezvous', implemented = false,
+                      config_fields = {}, verbs = {} },
+}
+
+-- ------------------------------------------------- the four dimensions
+--
+-- Behaviour is the product of four fields, not a kind string
+-- (doc/FETCHPOINT-DESIGN.md §1). This block is the vocabulary; the
+-- validator that applies the matrix (§4) at config time BY NAME and the two
+-- derives that exist only for the transition are in depth below.
+local DIM = {}
+M.DIM = DIM
+DIM.choices = {
+  source        = { 'observed', 'asserted' },
+  access        = { 'anyone', 'token', 'code' },
+  channel       = { 'http', 'dns', 'both' },
+  behavior      = { 'report', 'redirect', 'route' },
+  subject       = { 'caller', 'self' },
+  redirect_kind = { 'status', 'cname' },
+  report_format = { 'json', 'text', 'addr-port' },
+}
+DIM.set = {}
+for k, choices in pairs(DIM.choices) do
+  DIM.set[k] = {}
+  for _, c in ipairs(choices) do DIM.set[k][c] = true end
+end
+DIM.STATUSES = { [301] = true, [302] = true, [307] = true, [308] = true }
+
+-- Every key a dimension-shaped create or PATCH may carry. Anything else is
+-- refused by name -- the manner the host treats an unknown deployment key,
+-- and for the same reason: a typo that becomes a silent default is worse
+-- than an error. `rooms` and `config` are transitional: rooms are not yet an
+-- object of their own, so their settings still ride in config.
+DIM.FIELDS = {
+  name = true, template = true,
+  source = true, access = true, channel = true, behavior = true, subject = true,
+  redirect_kind = true, redirect_target = true, redirect_status = true,
+  report_format = true, published_address = true, published_locked = true,
+  serve_relay_config = true, rooms = true, config = true,
+}
+
+-- Config keys the dimensions REPLACED. Refused by name on a dimension-shaped
+-- body, with the replacement in the sentence, so a client written against
+-- the old shape learns the new one from the refusal rather than from a
+-- silently ignored setting. Read for OLD rows only, in DIM.of.
+DIM.RETIRED = {
+  serve            = 'channel and behavior',
+  address_override = 'published_address with published_locked',
+  format           = 'report_format',
+  ice              = 'serve_relay_config',
+}
+
+-- ============================ depth ============================
+
+-- depth: the string predicates and the codec.
+
+-- An IP literal, v4 strictly and v6 loosely: the nameserver will validate
+-- for real; this check keeps prose and URLs out of address columns. Shared
+-- by the paste endpoint, the address_override config field, the published
+-- address and the CNAME target, so it is deliberately not tightened here.
+function M.valid_ip(s)
+  if type(s) ~= 'string' then return false end
+  local a, b, c, d = s:match('^(%d+)%.(%d+)%.(%d+)%.(%d+)$')
+  if a then
+    for _, o in ipairs({ a, b, c, d }) do
+      if #o > 3 or tonumber(o) > 255 then return false end
+    end
+    return true
+  end
+  return #s <= 45 and s:find(':', 1, true) ~= nil and s:match('^[0-9a-f:]+$') ~= nil
+end
+
+-- crypto/random answers in HEX and a guest has no base32, so the regrouping
+-- happens here: 8-bit bytes in, 5-bit symbols out. Ten bytes divides into
+-- sixteen symbols with nothing left over, which is why LABEL_BYTES is ten.
+-- The draw is the caller's: discofetch-db-lib's claim_label and
+-- discofetch-accounts-lib's token and invite mints all hand the hex in.
+function M.base32_from_hex(hex)
+  local out, acc, nbits = {}, 0, 0
+  for i = 1, #hex, 2 do
+    acc = (acc << 8) | tonumber(hex:sub(i, i + 1), 16)
+    nbits = nbits + 8
+    while nbits >= 5 do
+      nbits = nbits - 5
+      local k = (acc >> nbits) & 31
+      out[#out + 1] = M.B32:sub(k + 1, k + 1)
+    end
+    acc = acc & ((1 << nbits) - 1)
+  end
+  return table.concat(out)
+end
+
+function M.valid_label(s)
+  return type(s) == 'string' and #s == 16 and s:match('^[a-z2-7]+$') ~= nil
+end
+
+-- A reserved/system name ('reflect') is label-shaped without being 16
+-- base32 symbols: lowercase, starts on a letter, 3-63, and NEVER contains
+-- '--', which is the label--verb separator. Generated labels can never
+-- collide with these (wrong length or wrong alphabet), and when custom
+-- slugs land they inherit exactly this shape plus a reserved-word list.
+function M.valid_name_label(s)
+  return type(s) == 'string' and #s >= 3 and #s <= 63
+     and s:match('^[a-z][a-z0-9%-]*$') ~= nil
+     and not s:match('%-$') and not s:find('--', 1, true)
+end
+
+-- depth: config validation. Refuse unknown config keys BY NAME -- the manner
+-- the host treats an unknown deployment key, and for the same reason: a typo
+-- that becomes a silent default is worse than an error.
+-- `dims` is true for a row the new create shape wrote (doc/FETCHPOINT-DESIGN
+-- §1): its config bag is validated against the derived kind's spec, but the
+-- kind's REQUIRED keys are waived, because the one such key (target, for
+-- system:redirect) is a dimension column on that row, and the matrix has
+-- already demanded it. Without the waiver, a redirect shape could never be
+-- created: it derives system:redirect, and system:redirect wants config.target.
+function M.validate_config(kind, config, dims)
+  if type(config) ~= 'table' then
+    return nil, 'config must be a JSON object'
+  end
+  local spec = {}
+  for _, f in ipairs(M.KINDS[kind].config_fields) do spec[f.key] = f end
+  for k, v in pairs(config) do
+    local f = spec[k]
+    if not f then
+      return nil, 'config has no key named ' .. tostring(k) .. ' for ' .. kind
+    end
+    if f.type == 'string' and (type(v) ~= 'string' or #v < (f.min or 1) or #v > (f.max or 256)) then
+      return nil, k .. ' must be a string of ' .. (f.min or 1) .. '-' .. (f.max or 256) .. ' characters'
+    end
+    if f.type == 'ip' and not M.valid_ip(v) then
+      return nil, k .. ' must be an IPv4 or IPv6 literal'
+    end
+    if f.type == 'port' and (type(v) ~= 'number' or v < 1 or v > 65535 or v % 1 ~= 0) then
+      return nil, k .. ' must be an integer port, 1-65535'
+    end
+    if f.type == 'url' then
+      if type(v) ~= 'string' or #v > (f.max or 2048)
+        or not (v:match('^https?://[%w%-%.]+') and not v:match('[%c%s]')) then
+        return nil, k .. ' must be an http:// or https:// URL'
+      end
+    end
+    if f.type == 'choice' then
+      local okc = false
+      for _, c in ipairs(f.choices) do if v == c then okc = true end end
+      if not okc then
+        local names = {}
+        for i, c in ipairs(f.choices) do names[i] = tostring(c) end
+        return nil, k .. ' must be one of ' .. table.concat(names, ', ')
+      end
+    end
+  end
+  for _, f in ipairs(M.KINDS[kind].config_fields) do
+    if f.required and config[f.key] == nil and not dims then
+      return nil, 'config needs ' .. f.key .. ' for ' .. kind
+    end
+  end
+  -- Cross-field rules, which a per-field spec cannot say. Refused at
+  -- config time by name rather than at runtime by surprise (doc/ICE.md 4).
+  if kind == 'system:rendezvous' then
+    if config.ice == true and config.rooms ~= true then
+      return nil, 'ice needs rooms: the --ice verb and ufrag-keyed joins are what a room grows'
+    end
+    if config.turn == true and config.ice ~= true then
+      return nil, 'turn needs ice: the credential is handed out by the --ice verb'
+    end
+    if config.turn == true and config.room_auth == 'open' then
+      return nil, 'turn is refused on an open room: a TURN credential handed out anonymously spends your relay allowance for whoever asks'
+    end
+  end
+  return config
+end
+
+-- depth: the matrix. What it refuses, and why. Returns the dimensions
+-- normalised, or nil plus a code and a sentence. Every refusal here happens
+-- at config time so nothing can be created that the serve path then has to
+-- refuse at runtime by surprise (the discipline doc/ICE.md 4 argued for).
+function DIM.validate(body)
+  local d = {}
+  for k, v in pairs(body) do
+    if not DIM.FIELDS[k] then
+      local repl = DIM.RETIRED[k]
+      return nil, 'unknown_field', repl
+        and (k .. ' was replaced by ' .. repl)
+        or ('no field named ' .. tostring(k))
+    end
+  end
+  for k, choices in pairs(DIM.choices) do
+    local v = body[k]
+    if v ~= nil then
+      if type(v) ~= 'string' or not DIM.set[k][v] then
+        return nil, 'invalid_value', k .. ' must be one of ' .. table.concat(choices, ', ')
+      end
+      d[k] = v
+    end
+  end
+  for _, k in ipairs({ 'access', 'channel', 'behavior' }) do
+    if not d[k] then return nil, 'missing_field', k .. ' is required' end
+  end
+
+  -- report: about whom, and where the address comes from.
+  if d.behavior == 'report' then
+    if not d.subject then
+      return nil, 'missing_field', 'report needs subject: caller (what the caller looks like) or self (where this name points)'
+    end
+    if d.subject == 'caller' then
+      if d.source then return nil, 'not_applicable', 'a report of the caller stores nothing, so source does not apply' end
+      if body.published_address ~= nil or body.published_locked ~= nil then
+        return nil, 'not_applicable', 'a report of the caller has no published address to lock'
+      end
+      if d.channel ~= 'http' then
+        return nil, 'dns_cannot_report_caller', 'the answer differs per caller and a DNS record cannot; use channel: http'
+      end
+    else
+      if not d.source then return nil, 'missing_field', 'report of self needs source: observed or asserted' end
+    end
+  elseif d.subject then
+    return nil, 'not_applicable', 'subject only applies to behavior: report'
+  end
+
+  -- DNS is a rendering, not an interface (§4.1): nothing there can present a
+  -- credential, so a name rendered ONLY to DNS is public or it is refused.
+  if d.channel == 'dns' and d.access ~= 'anyone' then
+    return nil, 'dns_needs_public', 'a DNS record carries no credential; a dns-only name must be access: anyone'
+  end
+  if d.channel == 'dns' and d.behavior == 'route' then
+    return nil, 'dns_cannot_route', 'routing is a data path and DNS only names things; use channel: http'
+  end
+
+  -- redirect: two kinds, told apart by what answers. A status is answered by
+  -- us over HTTP; a CNAME is answered by the resolver and needs no HTTP at
+  -- all -- and a CNAME must be alone at its node, so it cannot share a name
+  -- with the A record the http side would need.
+  if d.behavior == 'redirect' then
+    local rk = d.redirect_kind or (d.channel == 'dns' and 'cname' or 'status')
+    if rk == 'status' and d.channel == 'dns' then
+      return nil, 'status_needs_http', 'nothing answers a 3xx over DNS; a status redirect needs channel: http (or both)'
+    end
+    if rk == 'cname' and d.channel ~= 'dns' then
+      return nil, 'cname_needs_dns', 'a CNAME is answered by the resolver alone; it needs channel: dns'
+    end
+    local target = body.redirect_target
+    if rk == 'cname' then
+      if type(target) ~= 'string' or target == '' then
+        return nil, 'missing_field', 'a cname redirect needs redirect_target: the NAME to point at'
+      end
+      if M.valid_ip(target) or target:match('^https?://') then
+        return nil, 'cname_needs_a_name', 'CNAME targets are names, not addresses or URLs'
+      end
+      if not target:match('^[a-z0-9][a-z0-9%-]*%.[a-z0-9%-%.]+$') or target:match('%.%.') or target:match('%-%.') then
+        return nil, 'invalid_value', 'redirect_target must be a hostname'
+      end
+    else
+      if target ~= nil then
+        if type(target) ~= 'string' or #target > 2048
+          or not (target:match('^https?://[%w%-%.]+') and not target:match('[%c%s]')) then
+          return nil, 'invalid_value', 'redirect_target must be an http:// or https:// URL'
+        end
+        if d.source then
+          return nil, 'not_applicable', 'a redirect to a fixed target has no reported address; drop source'
+        end
+        if d.channel == 'both' then
+          return nil, 'nothing_to_publish', 'a redirect to a fixed target has no address to publish in DNS; use channel: http'
+        end
+      else
+        -- No target: callers are sent to this name's OWN published address,
+        -- which is the old serve: redirect. It needs somewhere for that
+        -- address to come from.
+        if not d.source then
+          return nil, 'missing_field', 'a redirect with no redirect_target sends callers to this name\'s own address, so it needs source: observed or asserted'
+        end
+      end
+      local st = body.redirect_status
+      if st ~= nil and not DIM.STATUSES[st] then
+        return nil, 'invalid_value', 'redirect_status must be 301, 302, 307 or 308'
+      end
+      d.redirect_status = st
+    end
+    d.redirect_kind, d.redirect_target = rk, target
+  elseif body.redirect_target ~= nil or body.redirect_status ~= nil or d.redirect_kind then
+    return nil, 'not_applicable', 'redirect_* fields only apply to behavior: redirect'
+  end
+
+  if body.report_format ~= nil and not (d.behavior == 'report' and d.subject == 'caller') then
+    return nil, 'not_applicable', 'report_format only applies to a report of the caller'
+  end
+
+  -- The published address and its lock (§1.3). The lock is on the LINK
+  -- between observed and published, never on the write: a locked name keeps
+  -- observing, and the serve path reads both.
+  if body.published_address ~= nil then
+    if type(body.published_address) ~= 'string' or not M.valid_ip(body.published_address) then
+      return nil, 'invalid_value', 'published_address must be an IPv4 or IPv6 literal'
+    end
+    d.published_address = body.published_address
+  end
+  if body.published_locked ~= nil then
+    if type(body.published_locked) ~= 'boolean' then
+      return nil, 'invalid_value', 'published_locked is true or false'
+    end
+    d.published_locked = body.published_locked
+  end
+  if d.source == 'asserted' and d.published_locked == nil then
+    -- An asserted address is by definition not tracking anything.
+    d.published_locked = true
+  end
+
+  if body.serve_relay_config ~= nil then
+    if type(body.serve_relay_config) ~= 'boolean' then
+      return nil, 'invalid_value', 'serve_relay_config is true or false'
+    end
+    d.serve_relay_config = body.serve_relay_config
+  end
+  if body.template ~= nil and (type(body.template) ~= 'string' or #body.template > 64) then
+    return nil, 'invalid_value', 'template is a string of at most 64 characters'
+  end
+  d.template = body.template
+  return d
+end
+
+-- TRANSITIONAL. The dispatcher still keys verb gating and the config
+-- registry on `kind`, so a dimension-shaped row is written with the kind
+-- that serves it. This is the reverse of DIM.of and dies with it.
+function DIM.kind_of(d)
+  if d.behavior == 'report' then
+    return d.subject == 'caller' and 'system:reflect' or 'system:rendezvous'
+  elseif d.behavior == 'redirect' then
+    return d.redirect_target and 'system:redirect' or 'system:rendezvous'
+  end
+  return 'wireguard'   -- route: declared, unserved, 501
+end
+
+-- The dimensions of a row, from its columns -- or, TRANSITIONAL, derived
+-- from `kind` plus `config` for a row written before migration 9. The derive
+-- is the ONLY place kind is read for behaviour; it converges as rows are
+-- rewritten and is deleted with the kinds. `serve: dns` maps to `both`,
+-- because it always answered HTTP as well -- DNS was additive, and the old
+-- enum forced a false choice.
+--
+-- Returns the dimensions and the decoded config, since every caller wants
+-- both and decoding twice is how two readers disagree.
+--
+-- BOUND, not pure: a stored config arrives as text, so this one needs the
+-- injected decoder. M.new hands it in and publishes it as model.DIM.of.
+local function dim_of(json, r)
+  local cfg = r.config
+  if type(cfg) ~= 'table' then
+    local ok, decoded = pcall(json.decode, cfg or '{}')
+    cfg = (ok and type(decoded) == 'table') and decoded or {}
+  end
+  local d = {
+    template = r.template, source = r.source, access = r.access,
+    channel = r.channel, behavior = r.behavior, subject = r.subject,
+    published_address = r.published_address,
+    redirect_target = r.redirect_target, redirect_status = r.redirect_status,
+    report_format = r.report_format,
+  }
+  if r.published_locked ~= nil then d.published_locked = (r.published_locked == 1 or r.published_locked == true) end
+  if r.serve_relay_config ~= nil then d.serve_relay_config = (r.serve_relay_config == 1 or r.serve_relay_config == true) end
+  if d.behavior == nil then
+    local k = r.kind
+    if k == 'system:reflect' then
+      d.behavior, d.subject, d.channel, d.access = 'report', 'caller', 'http', 'anyone'
+      d.report_format = cfg.format
+    elseif k == 'system:rendezvous' then
+      d.subject, d.access = 'self', 'anyone'
+      d.source   = cfg.address_override and 'asserted' or 'observed'
+      d.channel  = cfg.serve == 'dns' and 'both' or 'http'
+      d.behavior = cfg.serve == 'redirect' and 'redirect' or 'report'
+      if cfg.address_override then
+        d.published_address, d.published_locked = cfg.address_override, true
+      else
+        d.published_locked = false
+      end
+      d.serve_relay_config = cfg.ice == true
+    elseif k == 'system:redirect' then
+      d.behavior, d.channel, d.access = 'redirect', 'http', 'anyone'
+      d.redirect_target, d.redirect_status = cfg.target, cfg.status
+    else
+      d.behavior, d.channel, d.access = 'route', 'http', 'anyone'
+    end
+    d.template = d.template or k
+  end
+  if d.behavior == 'redirect' then
+    d.redirect_kind = d.channel == 'dns' and 'cname' or 'status'
+  end
+  return d, cfg
+end
+
+-- depth: config secrets, and the window.
+--
+-- `secret = true` in the registry above marks a config field that is a
+-- CREDENTIAL rather than a setting -- advertise_key, room_pin -- and this is
+-- the third bearer credential in the program after the session and the token.
+-- The other two are already held back from an impersonation window because
+-- they OUTLIVE it (require_own_account); this one was not, and a staff member
+-- who reads or rewrites an advertise key walks out of the window still
+-- holding a working credential for that customer's name. Closing the window
+-- undoes nothing.
+--
+-- So, for the length of a window and no longer: not readable, not writable.
+-- Derived from the registry rather than from a list of field names kept in
+-- step with it -- a kind that grows a third credential must not depend on
+-- somebody grepping a file for the other two.
+--
+-- Both an ordered list AND a set, because the two callers want different
+-- halves of it: the projection asks "is this key secret", the refusal wants
+-- to NAME one, and a name pulled out of pairs() would be a different field on
+-- different runs.
+function M.secret_fields(kind)
+  local out = {}
+  local k = M.KINDS[kind]
+  for _, f in ipairs(k and k.config_fields or {}) do
+    if f.secret then out[#out + 1] = f.key; out[f.key] = true end
+  end
+  return out
+end
+
+-- The read half. 'redacted' is not a new placeholder: it is the word
+-- AUDIT_MASK already uses for a column a reader may not have, and one program
+-- needs one spelling of "withheld". THIS IS THE WINDOW, NOT THE FIELD --
+-- the account holder reads their own keys here exactly as they always did,
+-- which is what makes "PATCH config to rotate the advertise key" usable at
+-- all. Only the borrowed face is refused.
+--
+-- It also makes the panel's round trip safe rather than destructive: PATCH
+-- config is a whole-object replace, so the form sends back what it was given,
+-- REDACTED lands in the body, and the write half -- fetchpoints_update, now
+-- in discofetch-fetchpoint-lib -- reads it as "leave this one alone": the
+-- stored key is carried over and the settings beside it save. That half used
+-- to answer such a body with a 403, which was honest and useless: a
+-- whole-object replace ALWAYS carries the sentinel back, so the refusal fired
+-- on every PATCH and no staff member could change one setting on any
+-- fetchpoint that owns a secret.
+--
+-- Takes the boolean, not the request: the model never reads an HTTP request
+-- table, which is what keeps it free of discofetch-accounts-lib.
+function M.config_view(impersonating, kind, config)
+  if not impersonating then return config end
+  local secret = M.secret_fields(kind)
+  local out = {}
+  for k, v in pairs(config) do
+    if secret[k] then out[k] = M.REDACTED else out[k] = v end
+  end
+  return out
+end
+
+-- Whether a config PATCH actually says anything new. Compared FIELD BY FIELD
+-- rather than as encoded JSON: json.encode's key order is hash order, so two
+-- objects holding the same answers can encode to two different strings and
+-- every save would read as a change. Shallow is enough and is not a shortcut
+-- -- validate_config admits strings, numbers and booleans and nothing that
+-- nests.
+function M.same_config(a, b)
+  for k, v in pairs(a) do if b[k] ~= v then return false end end
+  for k, v in pairs(b) do if a[k] ~= v then return false end end
+  return true
+end
+
+-- depth: row shaping. Both of these are BOUND -- fp_row spells the fqdn out
+-- of the zone, and both decode a stored config -- but neither touches a
+-- database handle, which is why they are the model's and not the db's.
+local function fp_row(zone, json, r, d)
+  d = d or dim_of(json, r)
+  local out = {
+    label      = r.label,
+    fqdn       = r.label .. '.' .. zone,
+    name       = r.name,
+    kind       = r.kind,       -- TRANSITIONAL: readers move to the dimensions
+    template   = d.template,
+    source     = d.source,
+    access     = d.access,
+    channel    = d.channel,
+    behavior   = d.behavior,
+    subject    = d.subject,
+    redirect_kind   = d.redirect_kind,
+    redirect_target = d.redirect_target,
+    redirect_status = d.redirect_status,
+    report_format   = d.report_format,
+    published_address  = d.published_address,
+    serve_relay_config = d.serve_relay_config,
+    created_at = r.created_at,
+    updated_at = r.updated_at,
+  }
+  -- Only a name with an address of its own has a lock to report.
+  if d.source then out.published_locked = d.published_locked == true end
+  return out
+end
+
+-- The list row's second half: enough to say what a name is FOR and
+-- whether it is working, without the config the list deliberately
+-- withholds (the advertise key lives there). `mode` is the non-secret
+-- shape of a rendezvous -- serve, rooms, the pin -- which is what decides
+-- the job it was created for; `advertised` is the same pair the owner's
+-- detail carries. A dashboard that has to GET every row to draw a dot
+-- is a dashboard that stops drawing dots at the tenth row.
+--
+-- r.adv_address and r.adv_at are aliases the advertisement LEFT JOIN
+-- invents, which is the one place this library knows a query shape; see the
+-- README.
+local function fp_row_status(zone, json, r)
+  local out = fp_row(zone, json, r)
+  if r.kind == 'system:rendezvous' and r.config then
+    local cfg = json.decode(r.config) or {}
+    out.mode = { serve = cfg.serve or 'json', rooms = cfg.rooms == true }
+    if cfg.address_override then out.mode.pinned = cfg.address_override end
+  end
+  if r.adv_address then
+    out.advertised = { address = r.adv_address, at = r.adv_at }
+  end
+  return out
+end
+
+-- Is this Host a FetchPoint address, and if so which one?
+--
+-- Returns the label, or nil for anything else -- api.discofetch.net, the raw
+-- IP a health check arrives on, an empty Host from a client that sent none.
+-- Only exactly one label-shaped component under the zone counts: a deeper
+-- name like a.b.discofetch.link is not a FetchPoint and must not be treated
+-- as one, or a wildcard certificate plus a creative sub-name becomes a way to
+-- address something that was never allocated.
+--
+-- It produces serve_fetchpoint's two arguments; it is not part of serving,
+-- and no library in this set parses a Host anywhere else.
+local function fetchpoint_host(zone, h)
+  if type(h) ~= 'string' or h == '' then return nil end
+  local candidate = h:match('^([^.]+)%.' .. zone:gsub('%.', '%%.') .. '$')
+  if not candidate then return nil end
+  -- <base>--<verb>: the first '--' splits, and only the first can exist
+  -- because neither half may contain one.
+  local base, verb = candidate:match('^(.-)%-%-(.+)$')
+  if not base then base, verb = candidate, nil end
+  if M.valid_label(base) or M.valid_name_label(base) then return base, verb end
+  return nil
+end
+
+-- depth: the constructor. Everything above is pure; these four need the
+-- deployment's zone or a json decoder, so they are bound here rather than
+-- reaching for a global. Two instances (a test's zone and the deployment's)
+-- coexist because the only state is in these closures.
+--
+-- A missing or wrong-typed dep is a named failure HERE, with a sentence, and
+-- not a nil call inside fp_row on the first list request.
+function M.new(deps)
+  deps = deps or {}
+  assert(type(deps.zone) == 'string' and deps.zone ~= '',
+    'discofetch-model-lib: deps.zone must be the deployment zone as a string, e.g. "discofetch.link"')
+  assert(type(deps.json) == 'table' and type(deps.json.decode) == 'function',
+    'discofetch-model-lib: deps.json must be a table with a decode function -- a stored config arrives as text')
+  local zone, json = deps.zone, deps.json
+
+  -- The pure half rides along so a consumer holds one handle. DIM keeps its
+  -- shared pure members through __index and gains the bound `of`.
+  local self = {
+    zone            = zone,
+    B32             = M.B32,
+    LABEL_BYTES     = M.LABEL_BYTES,
+    REDACTED        = M.REDACTED,
+    KINDS           = M.KINDS,
+    valid_ip        = M.valid_ip,
+    base32_from_hex = M.base32_from_hex,
+    valid_label     = M.valid_label,
+    valid_name_label = M.valid_name_label,
+    validate_config = M.validate_config,
+    secret_fields   = M.secret_fields,
+    config_view     = M.config_view,
+    same_config     = M.same_config,
+  }
+  self.DIM = setmetatable({
+    of = function(r) return dim_of(json, r) end,
+  }, { __index = DIM })
+  self.fp_row        = function(r, d) return fp_row(zone, json, r, d) end
+  self.fp_row_status = function(r) return fp_row_status(zone, json, r) end
+  self.fetchpoint_host = function(h) return fetchpoint_host(zone, h) end
+  return self
+end
+
+return M
